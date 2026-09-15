@@ -137,7 +137,10 @@ def result_frame(results: list[dict]) -> pd.DataFrame:
     frame = pd.DataFrame(results)
     if frame.empty:
         return frame
-    columns = [column for column in DISPLAY_COLUMNS if column in frame.columns]
+    extra_columns = ["RequestedRole"]
+    columns = [
+        column for column in DISPLAY_COLUMNS + extra_columns if column in frame.columns
+    ]
     return frame[columns]
 
 
@@ -152,10 +155,16 @@ def search(
     prompt: str,
     limit: int,
 ) -> dict:
-    return get_service().search_with_validation(
-        job_description=prompt,
-        limit=limit,
-    )
+    service = get_service()
+    intent = service.detect_intent(prompt)
+    if intent == "team_composition":
+        return service.team_composition(prompt)
+    if intent == "staffing_gap_analysis":
+        return service.staffing_gap_analysis(prompt)
+    return {
+        **service.search_with_validation(job_description=prompt, limit=limit),
+        "mode": "resource_search",
+    }
 
 
 def main() -> None:
@@ -230,6 +239,8 @@ def main() -> None:
         ]
     if "results" not in st.session_state:
         st.session_state.results = []
+    if "analysis" not in st.session_state:
+        st.session_state.analysis = None
 
     st.markdown("### Staffing assistant")
     for message in st.session_state.messages:
@@ -243,11 +254,15 @@ def main() -> None:
         search_response = search(prompt, limit=25)
         results = search_response["results"]
         st.session_state.results = results
-        validation_message = search_response["validation_message"]
+        st.session_state.analysis = search_response
+        validation_message = search_response.get("validation_message")
         st.session_state.messages.append(
             {
                 "role": "assistant",
                 "content": (
+                    search_response.get("summary")
+                    if search_response.get("mode") != "resource_search"
+                    else
                     f"I found **{len(results)}** matching resource(s). "
                     "The ranked details are shown below."
                     if results
@@ -259,12 +274,45 @@ def main() -> None:
         st.rerun()
 
     st.markdown("### Ranked resources")
+    analysis = st.session_state.get("analysis") or {}
+    if analysis.get("mode") == "staffing_gap_analysis":
+        gap_columns = st.columns(4)
+        for column, value, label in zip(
+            gap_columns,
+            (
+                analysis["requested_quantity"],
+                analysis["available_supply"],
+                analysis["shortfall"],
+                analysis["capacity_percent"],
+            ),
+            ("Requested", "Available supply", "Shortfall", "Capacity %"),
+        ):
+            column.metric(label, value)
+        if analysis.get("country_breakdown"):
+            st.caption(
+                "Supply by country: "
+                + ", ".join(
+                    f"{country} ({count})"
+                    for country, count in analysis["country_breakdown"].items()
+                )
+            )
+    elif analysis.get("mode") == "team_composition" and analysis.get("gaps"):
+        st.error(
+            "Role gaps: "
+            + ", ".join(
+                f"{gap['role']} short by {gap['shortfall']}"
+                for gap in analysis["gaps"]
+            )
+        )
     frame = result_frame(st.session_state.results)
     if frame.empty:
         st.info(
             st.session_state.get(
                 "validation_message",
-                "Start a staffing conversation above to see ranked resources.",
+                analysis.get(
+                    "summary",
+                    "Start a staffing conversation above to see ranked resources.",
+                ),
             )
         )
         return

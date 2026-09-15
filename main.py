@@ -18,6 +18,10 @@ class ResourceSearchRequest(BaseModel):
     limit: int = Field(default=25, ge=1, le=100)
 
 
+class AnalysisRequest(BaseModel):
+    prompt: str = Field(min_length=1)
+
+
 @app.get("/resources/columns")
 def resource_columns():
     return {"columns": techops_service.get_columns()}
@@ -39,6 +43,19 @@ def search_resources(request: ResourceSearchRequest):
         "mode": "structured",
         "count": len(results),
         "results": results,
+    }
+
+
+@app.post("/resources/analyze")
+def analyze_resources(request: AnalysisRequest):
+    intent = techops_service.detect_intent(request.prompt)
+    if intent == "team_composition":
+        return techops_service.team_composition(request.prompt)
+    if intent == "staffing_gap_analysis":
+        return techops_service.staffing_gap_analysis(request.prompt)
+    return {
+        "mode": "resource_search",
+        **techops_service.search_with_validation(request.prompt),
     }
 
 

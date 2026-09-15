@@ -59,3 +59,24 @@ The UI provides:
 - A recent-question sidebar with the last 10 staffing searches, which can be run again.
 - Ranked results showing all PMO fields, match score, and matched fields.
 - CSV and Excel downloads for the selected staffing results.
+
+## Intent-routed analysis modes
+
+The application also detects two structured analysis intents before falling
+back to individual resource search:
+
+- **Team composition:** prompts such as
+  `Build a team of five resources for an Azure migration project: one architect,
+  two engineers, one DevOps specialist, and one tester.` are parsed into role
+  slots. The service selects unique currently available resources, reports
+  unfilled role slots, and keeps eligibility decisions deterministic.
+- **Staffing gap analysis:** prompts such as
+  `Do we have enough available Azure resources for three projects?` calculate
+  current supply, capacity, shortfall, country distribution, and skill
+  distribution from the workbook.
+
+The intent router returns `team_composition`, `staffing_gap_analysis`, or
+`resource_search`. The `POST /resources/analyze` endpoint exposes the same
+routing for API clients. Azure OpenAI/Azure AI Foundry can be added later as an
+explanation or summarization layer over these verified results; it does not
+replace the deterministic selection rules.

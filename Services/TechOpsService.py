@@ -83,6 +83,227 @@ class TechOpsService:
     def get_columns(self) -> list[str]:
         return TECHOPS_COLUMNS.copy()
 
+    def detect_intent(self, prompt: str) -> str:
+        """Route prompts to deterministic staffing, team, or supply-gap analysis."""
+        text = prompt.lower()
+        if re.search(
+            r"\b(?:build|compose|form|assemble)\s+(?:a\s+)?team\b|\bteam\s+of\s+\d+",
+            text,
+        ):
+            return "team_composition"
+        if re.search(
+            r"\b(?:enough|underrepresented|shortage|gap|supply|demand|"
+            r"how many).{0,80}\b(?:resource|resources|skill|skills|project|projects)\b",
+            text,
+        ) or re.search(r"\b(?:staffing|capacity)\s+gap\b", text):
+            return "staffing_gap_analysis"
+        return "resource_search"
+
+    def team_composition(self, prompt: str) -> dict[str, Any]:
+        """Build a deterministic, de-duplicated team from role requirements."""
+        data = self.load_data()
+        requested_skills = self._requested_skills(data, prompt)
+        role_requirements = self._team_role_requirements(prompt)
+        if not role_requirements:
+            role_requirements = [("resource", 1)]
+
+        available = data[
+            self.currently_available_mask(data)
+            & ~data.apply(self._has_unavailable_skill, axis=1)
+        ]
+        if requested_skills:
+            skill_mask = pd.Series(
+                [
+                    any(
+                        self._skill_matches_row(row, skill)
+                        for skill in requested_skills
+                    )
+                    for _, row in available.iterrows()
+                ],
+                index=available.index,
+                dtype=bool,
+            )
+            available = available[skill_mask]
+
+        selected_ids: set[str] = set()
+        assignments: list[dict[str, Any]] = []
+        gaps: list[dict[str, Any]] = []
+        for role, quantity in role_requirements:
+            role_tokens = {
+                token for token in re.findall(r"[a-z0-9]+", role.lower())
+                if len(token) > 2
+            }
+            role_mask = pd.Series(
+                [
+                    bool(
+                        role_tokens
+                        & set(
+                            re.findall(
+                                r"[a-z0-9]+",
+                                f"{row['Primary Skill']} {row['Secondary Skill']}".lower(),
+                            )
+                        )
+                    )
+                    for _, row in available.iterrows()
+                ],
+                index=available.index,
+                dtype=bool,
+            )
+            role_candidates = available[role_mask]
+            if available.empty:
+                pool = available.copy()
+            else:
+                pool = pd.concat([role_candidates, available]).drop_duplicates(
+                    subset=["EnterpriseId"]
+                )
+            pool = pool[~pool["EnterpriseId"].astype(str).isin(selected_ids)]
+            chosen = pool.head(quantity)
+            for _, row in chosen.iterrows():
+                resource = {
+                    column: self._serialize_value(row[column], column)
+                    for column in TECHOPS_COLUMNS
+                }
+                resource["RequestedRole"] = role
+                resource["MatchScore"] = 100 if not role_candidates.empty else 80
+                resource["MatchedFields"] = [
+                    field for field in ("Primary Skill", "Secondary Skill")
+                    if requested_skills and any(
+                        self._skill_matches_row(row, skill)
+                        for skill in requested_skills
+                    )
+                ]
+                assignments.append(resource)
+                selected_ids.add(str(row["EnterpriseId"]))
+            if len(chosen) < quantity:
+                gaps.append(
+                    {
+                        "role": role,
+                        "requested": quantity,
+                        "found": len(chosen),
+                        "shortfall": quantity - len(chosen),
+                    }
+                )
+
+        return {
+            "mode": "team_composition",
+            "requested_skills": requested_skills,
+            "requested_roles": [
+                {"role": role, "quantity": quantity}
+                for role, quantity in role_requirements
+            ],
+            "results": assignments,
+            "gaps": gaps,
+            "summary": (
+                f"Built a team of {len(assignments)} resource(s). "
+                f"{sum(item['shortfall'] for item in gaps)} role slot(s) remain unfilled."
+                if gaps
+                else f"Built the requested team of {len(assignments)} resource(s)."
+            ),
+        }
+
+    def staffing_gap_analysis(self, prompt: str) -> dict[str, Any]:
+        """Quantify current deterministic supply against a requested demand."""
+        data = self.load_data()
+        requested_skills = self._requested_skills(data, prompt)
+        requested_count = self._requested_quantity(prompt)
+        available = data[self.currently_available_mask(data)]
+        if requested_skills:
+            skill_mask = pd.Series(
+                [
+                    any(
+                        self._skill_matches_row(row, skill)
+                        for skill in requested_skills
+                    )
+                    for _, row in available.iterrows()
+                ],
+                index=available.index,
+                dtype=bool,
+            )
+            matching = available[skill_mask]
+        else:
+            matching = available
+        available_capacity = pd.to_numeric(
+            matching["Availability"], errors="coerce"
+        ).fillna(0)
+        return {
+            "mode": "staffing_gap_analysis",
+            "requested_skills": requested_skills,
+            "requested_quantity": requested_count,
+            "available_supply": int(len(matching)),
+            "capacity_percent": int(available_capacity.sum()),
+            "shortfall": max(requested_count - len(matching), 0),
+            "country_breakdown": matching["Country"].value_counts().to_dict(),
+            "skill_breakdown": self._skill_breakdown(matching),
+            "results": [
+                {
+                    **{
+                        column: self._serialize_value(row[column], column)
+                        for column in TECHOPS_COLUMNS
+                    },
+                    "MatchScore": 100,
+                    "MatchedFields": self._matched_fields(row, requested_skills),
+                }
+                for _, row in matching.iterrows()
+            ],
+            "summary": (
+                f"Found {len(matching)} currently available resource(s) "
+                f"against a requested quantity of {requested_count}."
+            ),
+        }
+
+    @staticmethod
+    def _requested_quantity(prompt: str) -> int:
+        number_words = {
+            "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+            "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+        }
+        match = re.search(
+            r"\b(?:for|need|require|of)\s+(\d+|one|two|three|four|five|six|"
+            r"seven|eight|nine|ten)\b",
+            prompt.lower(),
+        )
+        if not match:
+            return 1
+        value = match.group(1)
+        return int(value) if value.isdigit() else number_words[value]
+
+    @staticmethod
+    def _team_role_requirements(prompt: str) -> list[tuple[str, int]]:
+        match = re.search(
+            r"(?:one|two|three|four|five|six|seven|eight|nine|ten|\d+)"
+            r"\s+(?:resource|resources)?\s*"
+            r"for\s+(.+?)(?:\.|$)",
+            prompt,
+            re.IGNORECASE,
+        )
+        source = match.group(1) if match else prompt
+        roles: list[tuple[str, int]] = []
+        pattern = (
+            r"\b(one|two|three|four|five|six|seven|eight|nine|ten|\d+)"
+            r"\s+([a-z][a-z -]*?)(?=,\s*(?:and\s+)?(?:one|two|three|four|"
+            r"five|six|seven|eight|nine|ten|\d+)\s+|$)"
+        )
+        words = {
+            "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+            "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+        }
+        for quantity, role in re.findall(pattern, source, re.IGNORECASE):
+            role = role.strip(" ,.")
+            if role:
+                roles.append((role, int(quantity) if quantity.isdigit() else words[quantity.lower()]))
+        return roles
+
+    @staticmethod
+    def _skill_breakdown(data: pd.DataFrame) -> dict[str, int]:
+        values: list[str] = []
+        for column in ("Primary Skill", "Secondary Skill"):
+            values.extend(
+                str(value).strip()
+                for value in data[column].tolist()
+                if str(value).strip()
+            )
+        return dict(pd.Series(values).value_counts().head(10))
+
     @staticmethod
     def currently_available_mask(data: pd.DataFrame) -> pd.Series:
         """Return resources with positive capacity and no active future contract."""
