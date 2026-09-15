@@ -1,57 +1,307 @@
-from openai import OpenAI
-from config import ENDPOINT, API_KEY, DEPLOYMENT
+from __future__ import annotations
 
-client = OpenAI(
-    base_url=ENDPOINT,
-    api_key=API_KEY
+from datetime import datetime
+from io import BytesIO
+
+import pandas as pd
+import streamlit as st
+
+from Services.TechOpsService import DISPLAY_COLUMNS, TechOpsService
+
+
+st.set_page_config(
+    page_title="Staffing Search | PM Assistant",
+    page_icon="",
+    layout="wide",
+    initial_sidebar_state="expanded",
 )
 
-conversation = []
 
-SYSTEM_PROMPT = """
-You are an experienced IT Project Manager Assistant.
+def get_service() -> TechOpsService:
+    return TechOpsService()
 
-Responsibilities:
-- Help prepare project plans
-- Create sprint plans
-- Generate user stories
-- Create meeting minutes
-- Prepare status reports
-- Identify project risks
-- Help with Agile and Scrum
-- Answer professionally using bullet points whenever appropriate.
-"""
 
-print("=" * 50)
-print("Project Manager Assistant")
-print("Type 'exit' to quit")
-print("=" * 50)
-
-while True:
-
-    user_input = input("\nYou: ")
-
-    if user_input.lower() == "exit":
-        print("Goodbye!")
-        break
-
-    conversation.append({
-        "role": "user",
-        "content": user_input
-    })
-
-    response = client.responses.create(
-        model=DEPLOYMENT,
-        instructions=SYSTEM_PROMPT,
-        input=conversation
+def apply_styles() -> None:
+    st.markdown(
+        """
+        <style>
+        @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Space+Grotesk:wght@500;600;700&display=swap');
+        html, body, [class*="css"] {
+            font-family: 'DM Sans', sans-serif;
+            color: #f5f2e9;
+        }
+        h1, h2, h3, h4, h5, h6,
+        [data-testid="stMarkdownContainer"] h1,
+        [data-testid="stMarkdownContainer"] h2,
+        [data-testid="stMarkdownContainer"] h3 {
+            color: #d8b85a !important;
+        }
+        p, label, li, [data-testid="stCaptionContainer"], [data-testid="stMetricLabel"] {
+            color: #f5f2e9 !important;
+        }
+        input, textarea, [data-baseweb="select"] *,
+        [data-testid="stChatInput"] * {
+            color: #111827 !important;
+            -webkit-text-fill-color: #111827 !important;
+        }
+        input::placeholder, textarea::placeholder,
+        [data-testid="stChatInput"] input::placeholder {
+            color: #4b5563 !important;
+            -webkit-text-fill-color: #4b5563 !important;
+        }
+        [data-testid="stAppViewContainer"] {
+            background:
+                linear-gradient(135deg, rgba(6, 20, 38, .96), rgba(10, 47, 75, .91)),
+                radial-gradient(circle at 85% 10%, #36d1dc 0, transparent 35%);
+        }
+        [data-testid="stHeader"] { background: transparent; }
+        [data-testid="stSidebar"] {
+            background: rgba(4, 16, 30, .92);
+            border-right: 1px solid rgba(255,255,255,.08);
+        }
+        .hero {
+            padding: 2rem 2.2rem 1.7rem;
+            border: 1px solid rgba(255,255,255,.13);
+            border-radius: 24px;
+            background: linear-gradient(115deg, rgba(18, 57, 91, .95), rgba(15, 126, 147, .64));
+            box-shadow: 0 18px 50px rgba(0,0,0,.18);
+            margin-bottom: 1.2rem;
+        }
+        .eyebrow { color: #d8b85a; font-size: .78rem; letter-spacing: .18em; font-weight: 700; }
+        .hero h1 { font-family: 'Space Grotesk', sans-serif; color: #f5f2e9; font-size: 2.5rem; margin: .35rem 0 .45rem; }
+        .hero p { color: #f5f2e9; font-size: 1.02rem; margin: 0; max-width: 720px; }
+        .metric {
+            background: rgba(255,255,255,.08);
+            border: 1px solid rgba(255,255,255,.1);
+            border-radius: 14px;
+            padding: .9rem 1rem;
+        }
+        .metric-value { color: #d8b85a; font-size: 1.45rem; font-weight: 700; }
+        .metric-label { color: #f5f2e9; font-size: .78rem; }
+        [data-testid="stMetricValue"], [data-testid="stMetricLabel"] { color: #f5f2e9 !important; }
+        [data-testid="stSidebar"] button {
+            background: #195487 !important;
+            border: 1px solid #2d6d9f !important;
+            color: #ffffff !important;
+            box-shadow: none !important;
+            transition: none !important;
+        }
+        [data-testid="stSidebar"] button:hover,
+        [data-testid="stSidebar"] button:focus,
+        [data-testid="stSidebar"] button:active {
+            background: #195487 !important;
+            border-color: #2d6d9f !important;
+            color: #ffffff !important;
+            box-shadow: none !important;
+        }
+        [data-testid="stSidebar"] button p,
+        [data-testid="stSidebar"] button span {
+            color: #ffffff !important;
+            -webkit-text-fill-color: #ffffff !important;
+        }
+        [data-testid="stDataFrame"] {
+            background: #f7f7f3;
+            color: #111827 !important;
+        }
+        [data-testid="stDataFrame"] * {
+            color: #111827 !important;
+        }
+        [data-testid="stDownloadButton"] button {
+            background: #195487 !important;
+            border: 1px solid #2d6d9f !important;
+            color: #ffffff !important;
+            box-shadow: none !important;
+            transition: none !important;
+        }
+        [data-testid="stDownloadButton"] button:hover,
+        [data-testid="stDownloadButton"] button:focus,
+        [data-testid="stDownloadButton"] button:active {
+            background: #195487 !important;
+            border-color: #2d6d9f !important;
+            color: #ffffff !important;
+            box-shadow: none !important;
+        }
+        [data-testid="stDownloadButton"] button p,
+        [data-testid="stDownloadButton"] button span {
+            color: #ffffff !important;
+            -webkit-text-fill-color: #ffffff !important;
+        }
+        .stChatMessage { background: rgba(255,255,255,.07); border-radius: 16px; }
+        </style>
+        """,
+        unsafe_allow_html=True,
     )
 
-    answer = response.output_text
 
-    print("\nAssistant:")
-    print(answer)
+def result_frame(results: list[dict]) -> pd.DataFrame:
+    frame = pd.DataFrame(results)
+    if frame.empty:
+        return frame
+    columns = [column for column in DISPLAY_COLUMNS if column in frame.columns]
+    return frame[columns]
 
-    conversation.append({
-        "role": "assistant",
-        "content": answer
-    })
+
+def excel_bytes(frame: pd.DataFrame) -> bytes:
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        frame.to_excel(writer, index=False, sheet_name="Staffing Results")
+    return output.getvalue()
+
+
+def search(
+    prompt: str,
+    limit: int,
+) -> dict:
+    return get_service().search_with_validation(
+        job_description=prompt,
+        limit=limit,
+    )
+
+
+def main() -> None:
+    apply_styles()
+    service = get_service()
+    data = service.get_dataframe()
+
+    st.markdown(
+        """
+        <section class="hero">
+            <div class="eyebrow">PMO RESOURCE INTELLIGENCE</div>
+            <h1>Staffing Search</h1>
+            <p>Find the right TechOps resource for your demand using skills, career level,
+            availability and location. The assistant is grounded in the PMO workbook.</p>
+        </section>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    with st.sidebar:
+        st.markdown("### Recent questions")
+        st.caption("Your last 10 staffing searches")
+        if "messages" not in st.session_state:
+            recent_questions = []
+        else:
+            recent_questions = [
+                message["content"]
+                for message in st.session_state.messages
+                if message["role"] == "user"
+            ][-10:][::-1]
+
+        if not recent_questions:
+            st.info("Your recent questions will appear here.")
+        for index, question in enumerate(recent_questions):
+            if st.button(
+                question,
+                key=f"recent_question_{index}",
+                width="stretch",
+                help="Run this question again",
+            ):
+                st.session_state.pending_prompt = question
+                st.rerun()
+
+        st.divider()
+        st.caption("Source")
+        st.markdown(f"**File:** `{service.file_path.name}`")
+        updated_at = datetime.fromtimestamp(
+            service.file_path.stat().st_mtime
+        ).strftime("%d %b %Y, %I:%M %p")
+        st.markdown(f"**Last updated:** `{updated_at}`")
+
+    available_count = int(service.currently_available_mask(data).sum())
+    metric_columns = st.columns(4)
+    for column, value, label in zip(
+        metric_columns,
+        (len(data), available_count, data["Country"].nunique(), data["Primary Skill"].nunique()),
+        ("Total resources", "Available resources", "Countries", "Primary skills"),
+    ):
+        column.markdown(
+            f'<div class="metric"><div class="metric-value">{value}</div>'
+            f'<div class="metric-label">{label}</div></div>',
+            unsafe_allow_html=True,
+        )
+
+    if "messages" not in st.session_state:
+        st.session_state.messages = [
+            {
+                "role": "assistant",
+                "content": "Tell me what staffing profile you need, for example: "
+                "'Find available AWS data platform resources in the UK'.",
+            }
+        ]
+    if "results" not in st.session_state:
+        st.session_state.results = []
+
+    st.markdown("### Staffing assistant")
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+
+    prompt = st.chat_input("Describe the role, skills, location or career level you need...")
+    prompt = prompt or st.session_state.pop("pending_prompt", None)
+    if prompt:
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        search_response = search(prompt, limit=25)
+        results = search_response["results"]
+        st.session_state.results = results
+        validation_message = search_response["validation_message"]
+        st.session_state.messages.append(
+            {
+                "role": "assistant",
+                "content": (
+                    f"I found **{len(results)}** matching resource(s). "
+                    "The ranked details are shown below."
+                    if results
+                    else validation_message or "Expected resource not available in TechOps"
+                ),
+            }
+        )
+        st.session_state.validation_message = validation_message
+        st.rerun()
+
+    st.markdown("### Ranked resources")
+    frame = result_frame(st.session_state.results)
+    if frame.empty:
+        st.info(
+            st.session_state.get(
+                "validation_message",
+                "Start a staffing conversation above to see ranked resources.",
+            )
+        )
+        return
+    if st.session_state.get("validation_message"):
+        st.error(st.session_state.validation_message)
+
+    display = frame.copy()
+    display["MatchedFields"] = display["MatchedFields"].apply(
+        lambda fields: ", ".join(fields) if isinstance(fields, list) else fields
+    )
+    st.dataframe(
+        display,
+        width="stretch",
+        hide_index=True,
+        column_config={
+            "MatchScore": st.column_config.ProgressColumn(
+                "Match score", min_value=0, max_value=100, format="%d"
+            ),
+            "Availability": st.column_config.NumberColumn("Availability %", format="%d"),
+        },
+    )
+    download_columns = [column for column in DISPLAY_COLUMNS if column in display.columns]
+    download_frame = display[download_columns]
+    download_col1, download_col2, _ = st.columns([1, 1, 4])
+    download_col1.download_button(
+        "Download CSV",
+        download_frame.to_csv(index=False).encode("utf-8"),
+        "staffing-results.csv",
+        "text/csv",
+    )
+    download_col2.download_button(
+        "Download Excel",
+        excel_bytes(download_frame),
+        "staffing-results.xlsx",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+
+if __name__ == "__main__":
+    main()
