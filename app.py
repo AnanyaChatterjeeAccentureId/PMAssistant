@@ -151,6 +151,82 @@ def excel_bytes(frame: pd.DataFrame) -> bytes:
     return output.getvalue()
 
 
+def analysis_header(analysis: dict) -> None:
+    mode_labels = {
+        "team_composition": "Team composition",
+        "resource_search": "Individual resource search",
+    }
+    mode = analysis.get("mode")
+    if not mode:
+        return
+    st.markdown(f"**Analysis mode:** `{mode_labels.get(mode, mode)}`")
+    if analysis.get("filters"):
+        st.caption(
+            "Applied filters: "
+            + ", ".join(
+                f"{key} = {value}"
+                for key, value in analysis["filters"].items()
+            )
+        )
+
+
+def render_team_analysis(analysis: dict) -> None:
+    if analysis.get("requested_roles"):
+        role_frame = pd.DataFrame(analysis["requested_roles"])
+        role_frame = role_frame.rename(
+            columns={
+                "role": "Requested role",
+                "quantity": "Quantity",
+                "skills": "Required skills",
+                "career_level": "Career level",
+            }
+        )
+        if "Required skills" in role_frame:
+            role_frame["Required skills"] = role_frame["Required skills"].apply(
+                lambda skills: ", ".join(skills) if isinstance(skills, list) else skills
+            )
+        st.dataframe(role_frame, hide_index=True, width="stretch")
+    if analysis.get("gaps"):
+        st.error(
+            "Role gaps: "
+            + ", ".join(
+                f"{gap['role']} short by {gap['shortfall']}"
+                for gap in analysis["gaps"]
+            )
+        )
+
+
+def render_gap_analysis(analysis: dict) -> None:
+    gap_columns = st.columns(4)
+    for column, value, label in zip(
+        gap_columns,
+        (
+            analysis["requested_quantity"],
+            analysis["available_supply"],
+            analysis["shortfall"],
+            analysis["capacity_percent"],
+        ),
+        ("Requested", "Eligible supply", "Shortfall", "Capacity %"),
+    ):
+        column.metric(label, value)
+    if analysis.get("country_breakdown"):
+        st.caption(
+            "Supply by country: "
+            + ", ".join(
+                f"{country} ({count})"
+                for country, count in analysis["country_breakdown"].items()
+            )
+        )
+    if analysis.get("skill_breakdown"):
+        st.caption(
+            "Top skills: "
+            + ", ".join(
+                f"{skill} ({count})"
+                for skill, count in list(analysis["skill_breakdown"].items())[:5]
+            )
+        )
+
+
 def search(
     prompt: str,
     limit: int,
@@ -158,12 +234,13 @@ def search(
     service = get_service()
     intent = service.detect_intent(prompt)
     if intent == "team_composition":
-        return service.team_composition(prompt)
-    if intent == "staffing_gap_analysis":
-        return service.staffing_gap_analysis(prompt)
+        response = service.team_composition(prompt)
+        response["intent_source"] = service.last_intent_source
+        return response
     return {
         **service.search_with_validation(job_description=prompt, limit=limit),
         "mode": "resource_search",
+        "intent_source": service.last_intent_source,
     }
 
 
@@ -256,65 +333,41 @@ def main() -> None:
         st.session_state.results = results
         st.session_state.analysis = search_response
         validation_message = search_response.get("validation_message")
+        st.session_state.validation_message = validation_message
+        if search_response.get("mode") != "resource_search":
+            assistant_message = search_response.get(
+                "summary", "Analysis completed."
+            )
+        elif results:
+            assistant_message = (
+                f"I found **{len(results)}** matching resource(s). "
+                "The ranked details are shown below."
+            )
+        else:
+            assistant_message = (
+                validation_message or "Expected resource not available in TechOps"
+            )
         st.session_state.messages.append(
             {
                 "role": "assistant",
-                "content": (
-                    search_response.get("summary")
-                    if search_response.get("mode") != "resource_search"
-                    else
-                    f"I found **{len(results)}** matching resource(s). "
-                    "The ranked details are shown below."
-                    if results
-                    else validation_message or "Expected resource not available in TechOps"
-                ),
+                "content": assistant_message,
             }
         )
-        st.session_state.validation_message = validation_message
         st.rerun()
 
     st.markdown("### Ranked resources")
     analysis = st.session_state.get("analysis") or {}
-    if analysis.get("mode") == "staffing_gap_analysis":
-        gap_columns = st.columns(4)
-        for column, value, label in zip(
-            gap_columns,
-            (
-                analysis["requested_quantity"],
-                analysis["available_supply"],
-                analysis["shortfall"],
-                analysis["capacity_percent"],
-            ),
-            ("Requested", "Available supply", "Shortfall", "Capacity %"),
-        ):
-            column.metric(label, value)
-        if analysis.get("country_breakdown"):
-            st.caption(
-                "Supply by country: "
-                + ", ".join(
-                    f"{country} ({count})"
-                    for country, count in analysis["country_breakdown"].items()
-                )
-            )
-    elif analysis.get("mode") == "team_composition" and analysis.get("gaps"):
-        st.error(
-            "Role gaps: "
-            + ", ".join(
-                f"{gap['role']} short by {gap['shortfall']}"
-                for gap in analysis["gaps"]
-            )
-        )
+    analysis_header(analysis)
+    if analysis.get("mode") == "team_composition":
+        render_team_analysis(analysis)
     frame = result_frame(st.session_state.results)
     if frame.empty:
         st.info(
-            st.session_state.get(
-                "validation_message",
-                analysis.get(
-                    "summary",
-                    "Start a staffing conversation above to see ranked resources.",
-                ),
-            )
+            st.session_state.get("validation_message")
+            or "Start a staffing conversation above to see ranked resources."
         )
+        if analysis.get("summary"):
+            st.caption(analysis["summary"])
         return
     if st.session_state.get("validation_message"):
         st.error(st.session_state.validation_message)
@@ -334,7 +387,10 @@ def main() -> None:
             "Availability": st.column_config.NumberColumn("Availability %", format="%d"),
         },
     )
-    download_columns = [column for column in DISPLAY_COLUMNS if column in display.columns]
+    download_columns = [
+        column for column in DISPLAY_COLUMNS + ["RequestedRole"]
+        if column in display.columns
+    ]
     download_frame = display[download_columns]
     download_col1, download_col2, _ = st.columns([1, 1, 4])
     download_col1.download_button(

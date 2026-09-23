@@ -50,11 +50,12 @@ def search_resources(request: ResourceSearchRequest):
 def analyze_resources(request: AnalysisRequest):
     intent = techops_service.detect_intent(request.prompt)
     if intent == "team_composition":
-        return techops_service.team_composition(request.prompt)
-    if intent == "staffing_gap_analysis":
-        return techops_service.staffing_gap_analysis(request.prompt)
+        response = techops_service.team_composition(request.prompt)
+        response["intent_source"] = techops_service.last_intent_source
+        return response
     return {
         "mode": "resource_search",
+        "intent_source": techops_service.last_intent_source,
         **techops_service.search_with_validation(request.prompt),
     }
 

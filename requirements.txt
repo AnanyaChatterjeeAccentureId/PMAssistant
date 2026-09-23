@@ -3,3 +3,5 @@ openpyxl
 fastapi
 uvicorn
 streamlit
+openai
+python-dotenv

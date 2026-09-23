@@ -7,6 +7,8 @@ from typing import Any
 
 import pandas as pd
 
+from Services.GenAIService import GenAIService
+
 
 TECHOPS_COLUMNS = [
     "EnterpriseId",
@@ -53,6 +55,7 @@ class TechOpsService:
             Path(__file__).resolve().parents[1] / "Data" / "TechOps_DataFile.xlsx"
         )
         self._data: pd.DataFrame | None = None
+        self.last_intent_source = "deterministic_fallback"
 
     def load_data(self) -> pd.DataFrame:
         if self._data is None:
@@ -84,51 +87,92 @@ class TechOpsService:
         return TECHOPS_COLUMNS.copy()
 
     def detect_intent(self, prompt: str) -> str:
-        """Route prompts to deterministic staffing, team, or supply-gap analysis."""
+        """Use Azure OpenAI for intent detection with a deterministic fallback."""
+        genai_intent = GenAIService.try_detect_intent(prompt)
+        if genai_intent:
+            self.last_intent_source = "azure_openai"
+            return genai_intent
+
+        self.last_intent_source = "deterministic_fallback"
         text = prompt.lower()
         if re.search(
-            r"\b(?:build|compose|form|assemble)\s+(?:a\s+)?team\b|\bteam\s+of\s+\d+",
+            r"\b(?:build|create|compose|form|assemble)\s+(?:a\s+)?team\b|"
+            r"\bteam\s+of\s+\d+",
             text,
         ):
             return "team_composition"
-        if re.search(
-            r"\b(?:enough|underrepresented|shortage|gap|supply|demand|"
-            r"how many).{0,80}\b(?:resource|resources|skill|skills|project|projects)\b",
-            text,
-        ) or re.search(r"\b(?:staffing|capacity)\s+gap\b", text):
-            return "staffing_gap_analysis"
         return "resource_search"
 
     def team_composition(self, prompt: str) -> dict[str, Any]:
         """Build a deterministic, de-duplicated team from role requirements."""
         data = self.load_data()
+        _, prompt_filters = self._parse_prompt_filters(data, prompt)
         requested_skills = self._requested_skills(data, prompt)
-        role_requirements = self._team_role_requirements(prompt)
+        role_requirements = self._team_role_requirements(data, prompt)
         if not role_requirements:
-            role_requirements = [("resource", 1)]
+            role_requirements = [
+                {"role": "resource", "quantity": 1, "skills": requested_skills}
+            ]
+        display_filters = dict(prompt_filters)
+        role_filters = dict(prompt_filters)
+        role_filters.pop("CL", None)
+        role_filters.pop("career_level_operator", None)
+        role_filters.pop("career_level_value", None)
+        display_filters.pop("CL", None)
+        display_filters.pop("career_level_operator", None)
+        display_filters.pop("career_level_value", None)
 
-        available = data[
-            self.currently_available_mask(data)
-            & ~data.apply(self._has_unavailable_skill, axis=1)
+        available = self._analysis_candidates(
+            data,
+            role_filters,
+            require_current_or_future_availability=True,
+        )
+        available = available[
+            ~available.apply(self._has_unavailable_skill, axis=1)
         ]
-        if requested_skills:
-            skill_mask = pd.Series(
-                [
-                    any(
-                        self._skill_matches_row(row, skill)
-                        for skill in requested_skills
-                    )
-                    for _, row in available.iterrows()
-                ],
-                index=available.index,
-                dtype=bool,
-            )
-            available = available[skill_mask]
-
         selected_ids: set[str] = set()
         assignments: list[dict[str, Any]] = []
         gaps: list[dict[str, Any]] = []
-        for role, quantity in role_requirements:
+        requested_slots = sum(
+            requirement["quantity"] for requirement in role_requirements
+        )
+        if available.empty:
+            gaps = [
+                {
+                    "role": requirement["role"],
+                    "requested": requirement["quantity"],
+                    "found": 0,
+                    "shortfall": requirement["quantity"],
+                }
+                for requirement in role_requirements
+            ]
+            return {
+                "mode": "team_composition",
+                "requested_skills": requested_skills,
+                "filters": self._analysis_filter_summary(display_filters),
+                "requested_roles": [
+                    {
+                        "role": requirement["role"],
+                        "quantity": requirement["quantity"],
+                        "skills": requirement["skills"],
+                        "career_level": requirement.get("career_level"),
+                    }
+                    for requirement in role_requirements
+                ],
+                "results": assignments,
+                "gaps": gaps,
+                "summary": (
+                    f"Team requirement: {requested_slots} resource(s); "
+                    "resources meeting requirements: 0; "
+                    f"resources not meeting requirements: {requested_slots}. "
+                    "Below required roles not found. There is gap. "
+                    "Need to check outside TechOps."
+                ),
+            }
+        for requirement in role_requirements:
+            role = requirement["role"]
+            quantity = requirement["quantity"]
+            role_skills = requirement["skills"]
             role_tokens = {
                 token for token in re.findall(r"[a-z0-9]+", role.lower())
                 if len(token) > 2
@@ -149,13 +193,30 @@ class TechOpsService:
                 index=available.index,
                 dtype=bool,
             )
-            role_candidates = available[role_mask]
-            if available.empty:
-                pool = available.copy()
-            else:
-                pool = pd.concat([role_candidates, available]).drop_duplicates(
-                    subset=["EnterpriseId"]
+            role_candidates = (
+                available
+                if role_skills
+                else available[role_mask]
+            )
+            pool = role_candidates
+            if role_skills:
+                skill_mask = pd.Series(
+                    [
+                        all(
+                            self._skill_matches_row(row, skill)
+                            for skill in role_skills
+                        )
+                        for _, row in pool.iterrows()
+                    ],
+                    index=pool.index,
+                    dtype=bool,
                 )
+                pool = pool[skill_mask]
+            if requirement.get("career_level") is not None:
+                pool = pool[
+                    pool["CL"].astype(str).str.strip()
+                    == str(requirement["career_level"])
+                ]
             pool = pool[~pool["EnterpriseId"].astype(str).isin(selected_ids)]
             chosen = pool.head(quantity)
             for _, row in chosen.iterrows():
@@ -164,7 +225,7 @@ class TechOpsService:
                     for column in TECHOPS_COLUMNS
                 }
                 resource["RequestedRole"] = role
-                resource["MatchScore"] = 100 if not role_candidates.empty else 80
+                resource["MatchScore"] = 100
                 resource["MatchedFields"] = [
                     field for field in ("Primary Skill", "Secondary Skill")
                     if requested_skills and any(
@@ -184,29 +245,56 @@ class TechOpsService:
                     }
                 )
 
+        summary = (
+            f"Team requirement: {requested_slots} resource(s); "
+            f"resources meeting requirements: {len(assignments)}; "
+            "resources not meeting requirements: 0. "
+            "All requested roles are staffed."
+            if not gaps
+            else (
+                f"Team requirement: {requested_slots} resource(s); "
+                f"resources meeting requirements: {len(assignments)}; "
+                f"resources not meeting requirements: "
+                f"{sum(item['shortfall'] for item in gaps)}. "
+                "Below required roles not found. There is gap. "
+                "Need to check outside TechOps."
+            )
+        )
         return {
             "mode": "team_composition",
             "requested_skills": requested_skills,
+            "filters": self._analysis_filter_summary(display_filters),
             "requested_roles": [
-                {"role": role, "quantity": quantity}
-                for role, quantity in role_requirements
+                {
+                    "role": requirement["role"],
+                    "quantity": requirement["quantity"],
+                    "skills": requirement["skills"],
+                    "career_level": requirement.get("career_level"),
+                }
+                for requirement in role_requirements
             ],
             "results": assignments,
             "gaps": gaps,
-            "summary": (
-                f"Built a team of {len(assignments)} resource(s). "
-                f"{sum(item['shortfall'] for item in gaps)} role slot(s) remain unfilled."
-                if gaps
-                else f"Built the requested team of {len(assignments)} resource(s)."
-            ),
+            "summary": summary,
         }
 
     def staffing_gap_analysis(self, prompt: str) -> dict[str, Any]:
         """Quantify current deterministic supply against a requested demand."""
         data = self.load_data()
+        _, prompt_filters = self._parse_prompt_filters(data, prompt)
         requested_skills = self._requested_skills(data, prompt)
         requested_count = self._requested_quantity(prompt)
-        available = data[self.currently_available_mask(data)]
+        asks_for_availability = bool(
+            prompt_filters.get("available_only")
+            or self._has_contract_date_filter(prompt_filters)
+            or re.search(r"\bcapacity\b|\bcurrently\b", prompt, re.IGNORECASE)
+        )
+        available = self._analysis_candidates(
+            data,
+            prompt_filters,
+            require_current_or_future_availability=asks_for_availability,
+        )
+        available = self._apply_career_filter(available, prompt_filters)
         if requested_skills:
             skill_mask = pd.Series(
                 [
@@ -232,8 +320,12 @@ class TechOpsService:
             "available_supply": int(len(matching)),
             "capacity_percent": int(available_capacity.sum()),
             "shortfall": max(requested_count - len(matching), 0),
-            "country_breakdown": matching["Country"].value_counts().to_dict(),
+            "country_breakdown": {
+                str(country): int(count)
+                for country, count in matching["Country"].value_counts().items()
+            },
             "skill_breakdown": self._skill_breakdown(matching),
+            "filters": self._analysis_filter_summary(prompt_filters),
             "results": [
                 {
                     **{
@@ -245,11 +337,111 @@ class TechOpsService:
                 }
                 for _, row in matching.iterrows()
             ],
-            "summary": (
-                f"Found {len(matching)} currently available resource(s) "
-                f"against a requested quantity of {requested_count}."
+            "summary": self._gap_summary(
+                matching_count=len(matching),
+                requested_count=requested_count,
+                has_future_date=self._has_contract_date_filter(prompt_filters),
+                uses_availability=asks_for_availability,
             ),
         }
+
+    @staticmethod
+    def _gap_summary(
+        matching_count: int,
+        requested_count: int,
+        has_future_date: bool,
+        uses_availability: bool,
+    ) -> str:
+        if has_future_date:
+            availability_label = "eligible resource(s) for the requested future date"
+        elif uses_availability:
+            availability_label = "currently available resource(s)"
+        else:
+            availability_label = "resource(s) in the current inventory"
+        return (
+            f"Found {matching_count} {availability_label} "
+            f"against a requested quantity of {requested_count}."
+        )
+
+    @classmethod
+    def _analysis_candidates(
+        cls,
+        data: pd.DataFrame,
+        filters: dict[str, Any],
+        require_current_or_future_availability: bool,
+    ) -> pd.DataFrame:
+        candidates = data.copy()
+        if filters.get("Country"):
+            candidates = candidates[
+                candidates["Country"].astype(str).str.casefold()
+                == str(filters["Country"]).casefold()
+            ]
+        if filters.get("City"):
+            candidates = candidates[
+                candidates["City"].astype(str).str.casefold()
+                == str(filters["City"]).casefold()
+            ]
+
+        if require_current_or_future_availability:
+            availability = pd.to_numeric(
+                candidates["Availability"], errors="coerce"
+            ).fillna(0)
+            end_dates = pd.to_datetime(
+                candidates["ContractEndDate"], errors="coerce"
+            )
+            if filters.get("contract_end_after") is not None:
+                candidates = candidates[
+                    (availability > 0)
+                    & end_dates.notna()
+                    & (end_dates <= filters["contract_end_after"])
+                ]
+            else:
+                candidates = candidates[cls.currently_available_mask(candidates)]
+
+        if filters.get("contract_start_after") is not None:
+            start_dates = pd.to_datetime(
+                candidates["ContractStartDate"], errors="coerce"
+            )
+            candidates = candidates[
+                start_dates >= filters["contract_start_after"]
+            ]
+        if filters.get("contract_start_before") is not None:
+            start_dates = pd.to_datetime(
+                candidates["ContractStartDate"], errors="coerce"
+            )
+            candidates = candidates[
+                start_dates <= filters["contract_start_before"]
+            ]
+        if filters.get("contract_end_before") is not None:
+            end_dates = pd.to_datetime(
+                candidates["ContractEndDate"], errors="coerce"
+            )
+            candidates = candidates[
+                end_dates <= filters["contract_end_before"]
+            ]
+        return candidates
+
+    @staticmethod
+    def _analysis_filter_summary(filters: dict[str, Any]) -> dict[str, str]:
+        summary: dict[str, str] = {}
+        for key in ("CL", "Country", "City"):
+            if filters.get(key) is not None:
+                summary[key] = str(filters[key])
+        if filters.get("career_level_operator"):
+            summary["CareerLevelOperator"] = (
+                f"{filters['career_level_operator']} {filters['career_level_value']}"
+            )
+        if filters.get("contract_end_after") is not None:
+            summary["AvailableAfter"] = filters[
+                "contract_end_after"
+            ].strftime("%Y-%m-%d")
+        if filters.get("available_only"):
+            summary["CurrentAvailability"] = (
+                "positive capacity through requested date"
+                if TechOpsService._has_contract_date_filter(filters)
+                else "positive capacity and contract ended"
+            )
+        return summary
 
     @staticmethod
     def _requested_quantity(prompt: str) -> int:
@@ -267,31 +459,149 @@ class TechOpsService:
         value = match.group(1)
         return int(value) if value.isdigit() else number_words[value]
 
-    @staticmethod
-    def _team_role_requirements(prompt: str) -> list[tuple[str, int]]:
-        match = re.search(
-            r"(?:one|two|three|four|five|six|seven|eight|nine|ten|\d+)"
-            r"\s+(?:resource|resources)?\s*"
-            r"for\s+(.+?)(?:\.|$)",
-            prompt,
-            re.IGNORECASE,
+    @classmethod
+    def _team_role_requirements(
+        cls, data: pd.DataFrame, prompt: str
+    ) -> list[dict[str, Any]]:
+        source = prompt
+        colon = prompt.find(":")
+        if colon >= 0:
+            source = prompt[colon + 1:]
+        else:
+            need_match = re.search(r"\bneed\s+", prompt, re.IGNORECASE)
+            if need_match:
+                source = prompt[need_match.end():]
+            else:
+                team_match = re.search(
+                    r"\bteam\s+(?:with|of)\s+", prompt, re.IGNORECASE
+                )
+                if team_match:
+                    source = prompt[team_match.end():]
+        source = re.split(
+            r"\b(?:all\s+)?(?:should\s+be\s+)?available\b|\bto\s+join\b",
+            source,
+            maxsplit=1,
+            flags=re.IGNORECASE,
+        )[0]
+        marker = re.compile(
+            r"\b(one|an|a|two|three|four|five|six|seven|eight|nine|ten|\d{1,3})"
+            r"\s+",
+            flags=re.IGNORECASE,
         )
-        source = match.group(1) if match else prompt
-        roles: list[tuple[str, int]] = []
-        pattern = (
-            r"\b(one|two|three|four|five|six|seven|eight|nine|ten|\d+)"
-            r"\s+([a-z][a-z -]*?)(?=,\s*(?:and\s+)?(?:one|two|three|four|"
-            r"five|six|seven|eight|nine|ten|\d+)\s+|$)"
-        )
+        markers = [
+            match for match in marker.finditer(source)
+            if not re.search(
+                r"(?:\bcl|\bcareer\s+level)\s*$",
+                source[:match.start()],
+                flags=re.IGNORECASE,
+            )
+        ]
+        roles: list[dict[str, Any]] = []
         words = {
+            "a": 1, "an": 1,
             "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
             "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
         }
-        for quantity, role in re.findall(pattern, source, re.IGNORECASE):
-            role = role.strip(" ,.")
-            if role:
-                roles.append((role, int(quantity) if quantity.isdigit() else words[quantity.lower()]))
+        for index, match in enumerate(markers):
+            quantity = match.group(1).lower()
+            segment_end = (
+                markers[index + 1].start()
+                if index + 1 < len(markers)
+                else len(source)
+            )
+            segment = source[match.end():segment_end].strip(" ,.")
+            details_match = re.search(r"\(([^)]*)\)", segment)
+            details = details_match.group(1) if details_match else segment
+            role = (
+                segment[:details_match.start()]
+                if details_match
+                else segment
+            ).strip(" ,.")
+            career_match = re.search(
+                r"\b(?:career\s+level|cl)\s*(?:is|=)?\s*(\d+)\b",
+                details,
+                re.IGNORECASE,
+            )
+            skill_text = re.sub(
+                r"\b(?:career\s+level|cl)\s*(?:is|=)?\s*\d+\b",
+                " ",
+                segment,
+                flags=re.IGNORECASE,
+            )
+            if re.search(r"\bazure\s+devops\b", skill_text, re.IGNORECASE):
+                skills = ["Azure DevOps"]
+            else:
+                skills = cls._requested_role_skills(data, skill_text)
+            roles.append(
+                {
+                    "role": role,
+                    "quantity": int(quantity) if quantity.isdigit() else words[quantity],
+                    "skills": skills,
+                    "career_level": (
+                        career_match.group(1) if career_match else None
+                    ),
+                }
+            )
         return roles
+
+    @classmethod
+    def _requested_role_skills(
+        cls, data: pd.DataFrame, text: str
+    ) -> list[str]:
+        normalized_text = cls._normalize_skill(text)
+        candidates: list[tuple[str, str, str]] = []
+        ai_request = bool(re.search(r"\b(?:ai|artificial intelligence)\b", text, re.I))
+        for column in ("Primary Skill", "Secondary Skill"):
+            for value in data[column].astype(str).unique():
+                skill = value.strip()
+                if not skill or skill.lower() in {
+                    "not available",
+                    "no skill available",
+                    "no skills available",
+                }:
+                    continue
+                normalized_skill = cls._normalize_skill(skill)
+                aliases = re.findall(r"\(([^)]+)\)", skill)
+                if ai_request and re.search(
+                    r"\b(?:ai|artificial intelligence)\b", skill, re.I
+                ):
+                    candidates.append((skill, normalized_skill, "ai"))
+                    continue
+                if normalized_skill in normalized_text:
+                    candidates.append((skill, normalized_skill, normalized_skill))
+                else:
+                    for alias in aliases:
+                        normalized_alias = cls._normalize_skill(alias)
+                        if re.search(
+                            rf"(?<!\w){re.escape(alias.strip())}(?!\w)",
+                            text,
+                            re.IGNORECASE,
+                        ):
+                            candidates.append((skill, normalized_skill, normalized_alias))
+                            break
+
+        selected: list[str] = []
+        selected_normalized: list[str] = []
+        for skill, normalized_skill, matched_term in sorted(
+            set(candidates),
+            key=lambda item: (
+                item[2] == item[1],
+                -len(item[1]),
+                len(item[2]),
+            ),
+            reverse=True,
+        ):
+            if any(
+                matched_term in existing
+                or existing in matched_term
+                or normalized_skill in existing
+                or existing in normalized_skill
+                for existing in selected_normalized
+            ):
+                continue
+            selected.append(skill)
+            selected_normalized.append(matched_term)
+        return selected
 
     @staticmethod
     def _skill_breakdown(data: pd.DataFrame) -> dict[str, int]:
@@ -302,7 +612,10 @@ class TechOpsService:
                 for value in data[column].tolist()
                 if str(value).strip()
             )
-        return dict(pd.Series(values).value_counts().head(10))
+        return {
+            str(skill): int(count)
+            for skill, count in pd.Series(values).value_counts().head(10).items()
+        }
 
     @staticmethod
     def currently_available_mask(data: pd.DataFrame) -> pd.Series:
@@ -413,8 +726,7 @@ class TechOpsService:
         return {
             "results": results[:requested_limit],
             "validation_message": (
-                "No resource found with all criteria. Below resources are "
-                "matching partially."
+                "Please find the resources partially matching with Ranking score"
             ),
         }
 
@@ -428,7 +740,11 @@ class TechOpsService:
         if operator:
             levels = pd.to_numeric(data["CL"], errors="coerce")
             target = filters["career_level_value"]
-            return data[levels < target if operator == "lower" else levels > target]
+            if operator == "lower":
+                return data[levels < target]
+            if operator == "at_least":
+                return data[levels >= target]
+            return data[levels > target]
         return data
 
     def _matched_optional_criteria(
@@ -444,9 +760,11 @@ class TechOpsService:
                 self._is_currently_available(row)
             )
         if filters.get("contract_end_after") is not None:
-            matches["Contract date"] = pd.to_datetime(
-                row["ContractEndDate"], errors="coerce"
-            ) <= filters["contract_end_after"]
+            contract_end = pd.to_datetime(row["ContractEndDate"], errors="coerce")
+            matches["Contract date"] = bool(
+                pd.notna(contract_end)
+                and contract_end <= filters["contract_end_after"]
+            )
         if filters.get("contract_start_after") is not None:
             matches["Contract date"] = pd.to_datetime(
                 row["ContractStartDate"], errors="coerce"
@@ -524,6 +842,8 @@ class TechOpsService:
             operator = prompt_filters["career_level_operator"]
             if operator == "lower":
                 data = data[levels < target]
+            elif operator == "at_least":
+                data = data[levels >= target]
             elif operator == "higher":
                 data = data[levels > target]
 
@@ -630,6 +950,14 @@ class TechOpsService:
             else:
                 filters["CL"] = value
             cleaned_prompt = cleaned_prompt.replace(level_match.group(0), " ")
+            if re.match(
+                r"\s*\+|\s*(?:and|or)\s+(?:above|higher)\b",
+                prompt[level_match.end():],
+                flags=re.IGNORECASE,
+            ):
+                filters.pop("CL", None)
+                filters["career_level_operator"] = "at_least"
+                filters["career_level_value"] = float(value)
 
         if re.search(
             r"\b(?:available|currently\s+available|availability\s*(?:greater|above|over|of)?"

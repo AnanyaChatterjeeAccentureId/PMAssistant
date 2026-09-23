@@ -62,21 +62,17 @@ The UI provides:
 
 ## Intent-routed analysis modes
 
-The application also detects two structured analysis intents before falling
-back to individual resource search:
+The application supports two modes:
 
 - **Team composition:** prompts such as
   `Build a team of five resources for an Azure migration project: one architect,
   two engineers, one DevOps specialist, and one tester.` are parsed into role
   slots. The service selects unique currently available resources, reports
   unfilled role slots, and keeps eligibility decisions deterministic.
-- **Staffing gap analysis:** prompts such as
-  `Do we have enough available Azure resources for three projects?` calculate
-  current supply, capacity, shortfall, country distribution, and skill
-  distribution from the workbook.
 
-The intent router returns `team_composition`, `staffing_gap_analysis`, or
-`resource_search`. The `POST /resources/analyze` endpoint exposes the same
-routing for API clients. Azure OpenAI/Azure AI Foundry can be added later as an
-explanation or summarization layer over these verified results; it does not
-replace the deterministic selection rules.
+The intent router returns `team_composition` or `resource_search`. Azure OpenAI
+is used for intent classification when the configured deployment is available.
+If Azure OpenAI is unavailable or returns invalid output, the application uses
+the deterministic fallback router. In both cases, resource eligibility remains
+deterministic and workbook-grounded; the model never selects or overrides
+resources.
